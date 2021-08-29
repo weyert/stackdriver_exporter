@@ -14,6 +14,7 @@
 package collectors
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -205,7 +206,11 @@ func fillConstMetricsLabels(metrics []ConstMetric) []ConstMetric {
 	allKeys := make(map[string]struct{})
 	for _, metric := range metrics {
 		for _, key := range metric.labelKeys {
-			allKeys[key] = struct{}{}
+			value, ok := allKeys[key]
+			fmt.Printf("Key '%v' and its value is %v\n", key, value)
+			if !ok {
+				allKeys[key] = struct{}{}
+			}
 		}
 	}
 	result := make([]ConstMetric, len(metrics))

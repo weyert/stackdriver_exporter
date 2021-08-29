@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,14 @@ var (
 		"collector.fill-missing-labels", "Fill missing metrics labels with empty string to avoid label dimensions inconsistent failure ($STACKDRIVER_EXPORTER_COLLECTOR_FILL_MISSING_LABELS).",
 	).Envar("STACKDRIVER_EXPORTER_COLLECTOR_FILL_MISSING_LABELS").Default("true").Bool()
 
+	collectorOverrideMetricLabels = kingpin.Flag(
+		"collector.override-metric-labels", "Use resource label value when metric label with same name exists (STACKDRIVER_EXPORTER_COLLECTOR_OVERRIDE_METRIC_LABELS)",
+	).Envar("STACKDRIVER_EXPORTER_COLLECTOR_OVERRIDE_METRIC_LABELS").Default("false").Bool()
+
+	monitoringMetricsIngestDelay = kingpin.Flag(
+		"monitoring.metrics-ingest-delay", "Offset for the Google Stackdriver Monitoring Metrics interval into the past by the ingest delay from the metric's metadata ($STACKDRIVER_EXPORTER_MONITORING_METRICS_INGEST_DELAY).",
+	).Envar("STACKDRIVER_EXPORTER_MONITORING_METRICS_INGEST_DELAY").Default("false").Bool()
+
 	monitoringDropDelegatedProjects = kingpin.Flag(
 		"monitoring.drop-delegated-projects", "Drop metrics from attached projects and fetch `project_id` only ($STACKDRIVER_EXPORTER_DROP_DELEGATED_PROJECTS).",
 	).Envar("STACKDRIVER_EXPORTER_DROP_DELEGATED_PROJECTS").Default("false").Bool()
@@ -58,6 +67,7 @@ type MonitoringCollector struct {
 	metricsTypePrefixes             []string
 	metricsInterval                 time.Duration
 	metricsOffset                   time.Duration
+	metricsIngestDelay              bool
 	monitoringService               *monitoring.Service
 	apiCallsTotalMetric             prometheus.Counter
 	scrapesTotalMetric              prometheus.Counter
@@ -66,6 +76,7 @@ type MonitoringCollector struct {
 	lastScrapeTimestampMetric       prometheus.Gauge
 	lastScrapeDurationSecondsMetric prometheus.Gauge
 	collectorFillMissingLabels      bool
+	collectorOverrideMetricLabels   bool
 	monitoringDropDelegatedProjects bool
 	logger                          log.Logger
 }
@@ -151,6 +162,7 @@ func NewMonitoringCollector(projectID string, monitoringService *monitoring.Serv
 		metricsTypePrefixes:             filteredPrefixes,
 		metricsInterval:                 *monitoringMetricsInterval,
 		metricsOffset:                   *monitoringMetricsOffset,
+		metricsIngestDelay:              *monitoringMetricsIngestDelay,
 		monitoringService:               monitoringService,
 		apiCallsTotalMetric:             apiCallsTotalMetric,
 		scrapesTotalMetric:              scrapesTotalMetric,
@@ -159,6 +171,7 @@ func NewMonitoringCollector(projectID string, monitoringService *monitoring.Serv
 		lastScrapeTimestampMetric:       lastScrapeTimestampMetric,
 		lastScrapeDurationSecondsMetric: lastScrapeDurationSecondsMetric,
 		collectorFillMissingLabels:      *collectorFillMissingLabels,
+		collectorOverrideMetricLabels:   *collectorOverrideMetricLabels,
 		monitoringDropDelegatedProjects: *monitoringDropDelegatedProjects,
 		logger:                          logger,
 	}
@@ -207,6 +220,8 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 
 		c.apiCallsTotalMetric.Inc()
 
+		re := regexp.MustCompile(fmt.Sprintf("^(%s)", strings.Join(c.metricsTypePrefixes, "|")))
+
 		// It has been noticed that the same metric descriptor can be obtained from different GCP
 		// projects. When that happens, metrics are fetched twice and it provokes the error:
 		//     "collected metric xxx was collected before with the same name and label values"
@@ -218,7 +233,10 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 		// The following makes sure metric descriptors are unique to avoid fetching more than once
 		uniqueDescriptors := make(map[string]*monitoring.MetricDescriptor)
 		for _, descriptor := range page.MetricDescriptors {
-			uniqueDescriptors[descriptor.Type] = descriptor
+			//uniqueDescriptors[descriptor.Type] = descriptor
+			if re.MatchString(descriptor.Type) {
+				uniqueDescriptors[descriptor.Type] = descriptor
+			}
 		}
 
 		errChannel := make(chan error, len(uniqueDescriptors))
@@ -238,6 +256,24 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 						c.projectID,
 						metricDescriptor.Type)
 				}
+
+				//
+				if c.metricsIngestDelay &&
+						metricDescriptor.Metadata != nil &&
+						metricDescriptor.Metadata.IngestDelay != "" {
+					//
+					ingestDelay := metricDescriptor.Metadata.IngestDelay
+					ingestDelayDuration, err := time.ParseDuration(ingestDelay)
+					if err != nil {
+						level.Error(c.logger).Log("msg", "error parsing ingest delay from metric metadata", "descriptor", metricDescriptor.Type, "err", err, "delay", ingestDelay)
+						errChannel <- err
+						return
+					}
+					level.Debug(c.logger).Log("msg", "adding ingest delay", "descriptor", metricDescriptor.Type, "delay", ingestDelay)
+					endTime.Add(ingestDelayDuration)
+					startTime.Add(ingestDelayDuration)
+				}
+
 				timeSeriesListCall := c.monitoringService.Projects.TimeSeries.List(utils.ProjectResource(c.projectID)).
 					Filter(filter).
 					IntervalStartTime(startTime.Format(time.RFC3339Nano)).
@@ -255,7 +291,7 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 						break
 					}
 					if err := c.reportTimeSeriesMetrics(page, metricDescriptor, ch); err != nil {
-						level.Error(c.logger).Log("msg", "error reporting Time Series metrics for descripto", "descriptor", metricDescriptor.Type, "err", err)
+						level.Error(c.logger).Log("msg", "error reporting Time Series metrics for descriptor", "descriptor", metricDescriptor.Type, "err", err)
 						errChannel <- err
 						break
 					}
@@ -273,35 +309,11 @@ func (c *MonitoringCollector) reportMonitoringMetrics(ch chan<- prometheus.Metri
 		return <-errChannel
 	}
 
-	var wg = &sync.WaitGroup{}
+	//
+	ctx := context.Background()
+	return c.monitoringService.Projects.MetricDescriptors.List(utils.ProjectResource(c.projectID)).
+		Pages(ctx, metricDescriptorsFunction)
 
-	errChannel := make(chan error, len(c.metricsTypePrefixes))
-
-	for _, metricsTypePrefix := range c.metricsTypePrefixes {
-		wg.Add(1)
-		go func(metricsTypePrefix string) {
-			defer wg.Done()
-			level.Debug(c.logger).Log("msg", "listing Google Stackdriver Monitoring metric descriptors starting with", "prefix", metricsTypePrefix)
-			ctx := context.Background()
-			filter := fmt.Sprintf("metric.type = starts_with(\"%s\")", metricsTypePrefix)
-			if c.monitoringDropDelegatedProjects {
-				filter = fmt.Sprintf(
-					"project = \"%s\" AND metric.type = starts_with(\"%s\")",
-					c.projectID,
-					metricsTypePrefix)
-			}
-			if err := c.monitoringService.Projects.MetricDescriptors.List(utils.ProjectResource(c.projectID)).
-				Filter(filter).
-				Pages(ctx, metricDescriptorsFunction); err != nil {
-				errChannel <- err
-			}
-		}(metricsTypePrefix)
-	}
-
-	wg.Wait()
-	close(errChannel)
-
-	return <-errChannel
 }
 
 func (c *MonitoringCollector) reportTimeSeriesMetrics(
@@ -345,8 +357,26 @@ func (c *MonitoringCollector) reportTimeSeriesMetrics(
 		// Add the monitored resource labels
 		// @see https://cloud.google.com/monitoring/api/resources
 		for key, value := range timeSeries.Resource.Labels {
-			labelKeys = append(labelKeys, key)
-			labelValues = append(labelValues, value)
+			// check if label already exists, if so skip it from being added so that the metric label is used instead of resource label
+			// replace the metric label and value with the resource label and value
+			labelIndex := indexOf(key, labelKeys)
+
+			if labelIndex != -1 {
+				level.Debug(c.logger).Log("msg", "resource label is not unique existing metric label found overriding this metric label", "metric", metricDescriptor.Name, "label", key)
+				if c.collectorOverrideMetricLabels {
+					// update the existing array item when needed
+					existingLabelValue := labelValues[labelIndex]
+					if existingLabelValue != value {
+						labelValues[labelIndex] = value
+					}
+				} else {
+					level.Debug(c.logger).Log("msg", "resource label is not unique existing metric label found, ignoring resource label", "metric", metricDescriptor.Name, "label", key)
+					continue
+				}
+			} else {
+				labelKeys = append(labelKeys, key)
+				labelValues = append(labelValues, value)
+			}
 		}
 
 		if c.monitoringDropDelegatedProjects {
@@ -454,4 +484,22 @@ func (c *MonitoringCollector) generateHistogramBuckets(
 		}
 	}
 	return buckets, nil
+}
+
+func contains(arr []string, str string) bool {
+	for _, a := range arr {
+		if a == str {
+			return true
+		}
+	}
+	return false
+}
+
+func indexOf(word string, data []string) int {
+	for index, v := range data {
+		if word == v {
+			return index
+		}
+	}
+	return -1
 }
